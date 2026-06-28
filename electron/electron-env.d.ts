@@ -291,6 +291,7 @@ interface Window {
 		storeRecordedVideo: (
 			videoData: ArrayBuffer,
 			fileName: string,
+			options?: { sidecar?: boolean },
 		) => Promise<{ success: boolean; path?: string; message?: string }>;
 		storeMicrophoneSidecar: (
 			audioData: ArrayBuffer,

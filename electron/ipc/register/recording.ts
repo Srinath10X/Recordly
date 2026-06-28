@@ -1993,11 +1993,20 @@ export function registerRecordingHandlers(
 		},
 	);
 
-	ipcMain.handle("store-recorded-video", async (_, videoData: ArrayBuffer, fileName: string) => {
+	ipcMain.handle(
+		"store-recorded-video",
+		async (_, videoData: ArrayBuffer, fileName: string, options?: { sidecar?: boolean }) => {
 		try {
 			const recordingsDir = await getRecordingsDir();
 			const videoPath = path.join(recordingsDir, fileName);
 			await fs.writeFile(videoPath, Buffer.from(videoData));
+			if (options?.sidecar) {
+				// Companion file (e.g. webcam): just persist it. It must NOT become the
+				// current video or claim the cursor telemetry — those belong to the screen
+				// recording, otherwise the cursor.json keys to the webcam and the editor's
+				// screen video shows no cursor overlay.
+				return { success: true, path: videoPath };
+			}
 			return await finalizeStoredVideo(videoPath);
 		} catch (error) {
 			console.error("Failed to store video:", error);

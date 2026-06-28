@@ -371,6 +371,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const startTime = useRef<number>(0);
 	const webcamStartTime = useRef<number | null>(null);
 	const webcamTimeOffsetMs = useRef(0);
+	// Keeps the webcam actively producing frames before/through recording. On Linux a
+	// v4l2 camera only starts its capture loop once something pulls frames, so without
+	// this the first recorded webcam frame can lag many seconds behind the screen.
+	const webcamWarmupVideo = useRef<HTMLVideoElement | null>(null);
 	const recordingSessionTimestamp = useRef<number | null>(null);
 	const nativeScreenRecording = useRef(false);
 	const nativeWindowsRecording = useRef(false);
@@ -594,6 +598,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		if (microphoneStream.current) {
 			microphoneStream.current.getTracks().forEach((track) => track.stop());
 			microphoneStream.current = null;
+		}
+
+		if (webcamWarmupVideo.current) {
+			webcamWarmupVideo.current.srcObject = null;
+			webcamWarmupVideo.current = null;
 		}
 
 		if (webcamStream.current) {
@@ -1001,6 +1010,28 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				audio: false,
 			});
 
+			// Pre-warm: drive the camera with a hidden, playing <video> so its capture
+			// loop is running and delivering frames BEFORE we start the recorder. Kept
+			// alive until the webcam is torn down so the camera never idles back to cold.
+			try {
+				const warmup = document.createElement("video");
+				warmup.muted = true;
+				warmup.playsInline = true;
+				warmup.srcObject = webcamStream.current;
+				webcamWarmupVideo.current = warmup;
+				await warmup.play().catch(() => undefined);
+				if (typeof warmup.requestVideoFrameCallback === "function") {
+					await new Promise<void>((resolve) => {
+						const done = () => resolve();
+						warmup.requestVideoFrameCallback(done);
+						// Don't block forever if the camera is unusually slow.
+						setTimeout(done, 2500);
+					});
+				}
+			} catch {
+				// Pre-warm is best-effort; recording still works without it.
+			}
+
 			const mimeType = selectWebcamMimeType();
 			webcamChunks.current = [];
 			resolvedWebcamPath.current = null;
@@ -1051,6 +1082,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					const result = await window.electronAPI.storeRecordedVideo(
 						arrayBuffer,
 						webcamFileName,
+						{ sidecar: true },
 					);
 					webcamStopResolver.current?.(result.success ? (result.path ?? null) : null);
 				} catch (error) {
@@ -1710,11 +1742,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						audio: withAudio,
 						video: {
 							displaySurface: "monitor",
-							// Don't request 4K: capturing oversized then downscaling is a
-							// main source of choppy Linux capture. Let the compositor deliver
-							// native resolution (cap at 4K only as an upper bound).
-							width: { max: TARGET_WIDTH },
-							height: { max: TARGET_HEIGHT },
+							// Cap at QHD (not 4K): software-encoding 4K@30 while a second webcam
+							// recorder also encodes pegs the CPU and stutters. QHD halves pixel
+							// throughput and drops the bitrate accordingly.
+							width: { max: QHD_WIDTH },
+							height: { max: QHD_HEIGHT },
 							frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
 							cursor: browserCursorPolicy.streamCursor,
 						},
@@ -1792,6 +1824,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (systemAudioTrack && micAudioTrack) {
 					const context = new AudioContext({ sampleRate: 48000 });
 					mixingContext.current = context;
+					// Chromium can create the context suspended; resume so the mixed audio
+					// graph is actually running (not silent) before recording starts.
+					void context.resume();
 					const systemSource = context.createMediaStreamSource(
 						new MediaStream([systemAudioTrack]),
 					);
@@ -1824,8 +1859,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 								displaySurface: selectedSource.id?.startsWith("window:")
 									? "window"
 									: "monitor",
-								width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
-								height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
+								// QHD cap (see acquireLinuxPortalStream) to avoid 4K encode stutter.
+								width: { max: QHD_WIDTH },
+								height: { max: QHD_HEIGHT },
 								frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
 								cursor: browserCursorPolicy.streamCursor,
 							},
@@ -1846,10 +1882,14 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			}
 
 			try {
+				// Linux portal capture is capped at QHD to avoid 4K software-encode stutter
+				// (a second webcam recorder runs concurrently); other platforms keep 4K.
+				const maxCaptureWidth = platform === "linux" ? QHD_WIDTH : TARGET_WIDTH;
+				const maxCaptureHeight = platform === "linux" ? QHD_HEIGHT : TARGET_HEIGHT;
 				await videoTrack.applyConstraints({
 					frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
-					width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
-					height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
+					width: { ideal: maxCaptureWidth, max: maxCaptureWidth },
+					height: { ideal: maxCaptureHeight, max: maxCaptureHeight },
 				} as MediaTrackConstraints);
 			} catch (error) {
 				console.warn(
@@ -1904,14 +1944,6 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			mediaRecorder.current = recorder;
 			recorder.ondataavailable = (event) => {
 				if (event.data && event.data.size > 0) chunks.current.push(event.data);
-			};
-			recorder.onstart = () => {
-				// Anchor cursor capture to the ACTUAL first frame. The portal stream has
-				// ~1.5s startup latency, so recorder.start() runs well before frames flow;
-				// starting the cursor clock here keeps it in sync with the video timeline.
-				if (platform === "linux") {
-					void window.electronAPI?.setRecordingState(true);
-				}
 			};
 			if (platform === "linux") {
 				const vt = stream.current.getVideoTracks()[0];
@@ -2014,20 +2046,64 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				setRecording(false);
 			};
 			const mainStartedAt = Date.now();
-			beginWebcamCapture();
-			resetRecordingClock(mainStartedAt);
-			webcamTimeOffsetMs.current =
-				webcamStartTime.current === null ? 0 : webcamStartTime.current - mainStartedAt;
-			recorder.start(RECORDER_TIMESLICE_MS);
-			setRecording(true);
-			// On Linux the cursor clock is started from recorder.onstart (first frame) to
-			// stay in sync with the portal stream; other platforms start it immediately.
-			if (platform !== "linux") {
+
+			// Unified start: screen+audio recorder, the (pre-warmed) webcam recorder, the
+			// recording clock and the main-process recording state all begin at one
+			// instant. Single-fire guarded so the rVFC gate and its timeout can't double-start.
+			let recordersStarted = false;
+			const startAllRecorders = (anchorAt: number) => {
+				if (recordersStarted) return;
+				recordersStarted = true;
+				recorder.start(RECORDER_TIMESLICE_MS);
+				beginWebcamCapture();
+				resetRecordingClock(anchorAt);
+				webcamTimeOffsetMs.current =
+					webcamStartTime.current === null ? 0 : webcamStartTime.current - anchorAt;
+				setRecording(true);
+				void window.electronAPI?.setRecordingState(true);
+			};
+
+			const screenVideoTrack = stream.current.getVideoTracks()[0];
+			const canGateOnFirstFrame =
+				platform === "linux" &&
+				!!screenVideoTrack &&
+				typeof HTMLVideoElement !== "undefined" &&
+				typeof HTMLVideoElement.prototype.requestVideoFrameCallback === "function";
+
+			if (canGateOnFirstFrame) {
+				// The portal stream delivers its first painted frame ~1.5–3.7s after the
+				// stream opens. Start ALL recorders only at that first frame so the screen,
+				// its muxed audio, and the webcam all begin together — no leading dead time,
+				// no audio/webcam getting a head start on the laggy portal video.
+				const probe = document.createElement("video");
+				probe.muted = true;
+				probe.playsInline = true;
+				probe.srcObject = new MediaStream([screenVideoTrack]);
+				const teardown = () => {
+					probe.srcObject = null;
+				};
 				try {
-					await window.electronAPI?.setRecordingState(true);
-				} catch (stateError) {
-					console.warn("Failed to notify main process that recording started:", stateError);
+					await probe.play();
+				} catch {
+					// autoplay of a muted detached element should not fail, but if it does
+					// fall through to the timeout below.
 				}
+				probe.requestVideoFrameCallback(() => {
+					startAllRecorders(Date.now());
+					teardown();
+				});
+				// Never hang if the portal never paints (broken capture): fall back to the
+				// old immediate-start behavior after a grace period.
+				setTimeout(() => {
+					if (!recordersStarted) {
+						startAllRecorders(Date.now());
+						teardown();
+					}
+				}, 4000);
+			} else {
+				// Non-Linux (and any platform lacking rVFC): no portal startup gap, so start
+				// everything immediately.
+				startAllRecorders(mainStartedAt);
 			}
 		} catch (error) {
 			console.error("Failed to start recording:", error);

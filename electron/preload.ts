@@ -537,8 +537,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	stopFfmpegRecording: () => {
 		return ipcRenderer.invoke("stop-ffmpeg-recording");
 	},
-	storeRecordedVideo: (videoData: ArrayBuffer, fileName: string) => {
-		return ipcRenderer.invoke("store-recorded-video", videoData, fileName);
+	storeRecordedVideo: (
+		videoData: ArrayBuffer,
+		fileName: string,
+		options?: { sidecar?: boolean },
+	) => {
+		return ipcRenderer.invoke("store-recorded-video", videoData, fileName, options);
 	},
 	storeMicrophoneSidecar: (
 		audioData: ArrayBuffer,
