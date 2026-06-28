@@ -864,6 +864,13 @@ interface Window {
 		setHasUnsavedChanges: (hasChanges: boolean) => void;
 		onRequestSaveBeforeClose: (callback: () => Promise<boolean>) => () => void;
 		isNativeWindowsCaptureAvailable: () => Promise<{ available: boolean }>;
+		isNativeLinuxCaptureAvailable: () => Promise<{
+			available: boolean;
+			session: "wayland" | "x11";
+			reason?: string;
+		}>;
+		isHyprland: () => boolean;
+		setCapturedStreamSize: (width: number, height: number) => Promise<void>;
 		muxNativeWindowsRecording: (expectedDurationMs?: number) => Promise<{
 			success: boolean;
 			path?: string;

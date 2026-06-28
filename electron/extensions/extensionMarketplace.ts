@@ -52,6 +52,25 @@ async function assertNoEscapedFiles(dir: string, root: string): Promise<void> {
 	}
 }
 
+/**
+ * Recursively grant read access to extracted files. Archives created on Windows
+ * (or otherwise) can store entries with mode 000, which unzip preserves —
+ * leaving the manifest/JS unreadable. Add read (and dir-traverse) bits so the
+ * extension can be validated, copied, and loaded.
+ */
+async function chmodTreeReadable(dir: string): Promise<void> {
+	await fs.chmod(dir, 0o755).catch(() => undefined);
+	const entries = await fs.readdir(dir, { withFileTypes: true });
+	for (const entry of entries) {
+		const entryPath = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			await chmodTreeReadable(entryPath);
+		} else if (entry.isFile()) {
+			await fs.chmod(entryPath, 0o644).catch(() => undefined);
+		}
+	}
+}
+
 function getMarketplaceUrl(): string {
 	// Allow explicit override for local marketplace development.
 	if (process.env.RECORDLY_MARKETPLACE_URL) return process.env.RECORDLY_MARKETPLACE_URL;
@@ -175,9 +194,11 @@ export async function downloadAndInstallExtension(
 	try {
 		const url = new URL(downloadUrl);
 		if (!allowedOrigins.some((o) => url.origin === o)) {
+			console.error(`[ext-install] REJECTED untrusted origin: ${url.origin}`);
 			return { success: false, error: `Untrusted download origin: ${url.origin}` };
 		}
 	} catch {
+		console.error(`[ext-install] REJECTED invalid URL: ${downloadUrl}`);
 		return { success: false, error: "Invalid download URL" };
 	}
 
@@ -251,6 +272,11 @@ export async function downloadAndInstallExtension(
 			}
 		});
 
+		// Some publishers zip files with no permission bits (mode 000 — common when
+		// archived on Windows), which unzip preserves, leaving the manifest and JS
+		// unreadable. Normalize permissions so the files can be read and copied.
+		await chmodTreeReadable(extractDir);
+
 		// Security: verify no extracted file escaped the extraction directory
 		// (protects against zip-slip / path traversal entries in malicious archives)
 		// Use fs.realpath so the root matches what fs.realpath returns for children
@@ -290,6 +316,7 @@ export async function downloadAndInstallExtension(
 
 		return { success: true };
 	} catch (error: unknown) {
+		console.error(`[ext-install] FAILED ${extensionId}:`, error);
 		return { success: false, error: getErrorMessage(error) };
 	} finally {
 		// Clean up temp directory

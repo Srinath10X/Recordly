@@ -586,7 +586,15 @@ export class ModernVideoExporter {
 				this.renderer = new ModernFrameRenderer({
 					width: this.config.width,
 					height: this.config.height,
-					preferredRenderBackend: undefined,
+					// Force WebGL on Linux: PixiJS's WebGPU backend crashes
+					// (BindGroupSystem "_resourceType" on the cursor-overlay filter), while
+					// WebGL renders the same scene without that path. darwin/win32 keep
+					// WebGPU auto-select.
+					preferredRenderBackend:
+						this.getRuntimePlatform() === "darwin" ||
+						this.getRuntimePlatform() === "win32"
+							? undefined
+							: "webgl",
 					wallpaper: this.config.wallpaper,
 					zoomRegions: this.config.zoomRegions,
 					showShadow: this.config.showShadow,

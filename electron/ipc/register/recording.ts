@@ -16,6 +16,11 @@ import { showCursor } from "../../cursorHider";
 import { getMonitorHandles } from "../monitorResolver";
 import { ALLOW_RECORDLY_WINDOW_CAPTURE } from "../constants";
 import { startWindowBoundsCapture, stopWindowBoundsCapture } from "../cursor/bounds";
+import {
+	setCapturedStreamSize,
+	startHyprlandCursorTracking,
+	stopHyprlandCursorTracking,
+} from "../cursor/hyprland";
 import { startInteractionCapture, stopInteractionCapture } from "../cursor/interaction";
 import { startNativeCursorMonitor, stopNativeCursorMonitor } from "../cursor/monitor";
 import {
@@ -69,6 +74,15 @@ import {
 	waitForNativeCaptureStop,
 } from "../recording/mac";
 import {
+	attachLinuxCaptureLifecycle,
+	buildLinuxFfmpegArgs,
+	isNativeLinuxCaptureAvailable,
+	resolvePulseMonitorSource,
+	resolveSystemFfmpegPath,
+	waitForLinuxCaptureStart,
+	waitForLinuxCaptureStop,
+} from "../recording/linux";
+import {
 	attachWindowsCaptureLifecycle,
 	isNativeWindowsCaptureAvailable,
 	muxNativeWindowsVideoWithAudio,
@@ -106,7 +120,14 @@ import {
 	setFfmpegScreenRecordingActive,
 	setIsCursorCaptureActive,
 	setLastLeftClick,
+	setLinuxCaptureOutputBuffer,
+	setLinuxCapturePaused,
+	setLinuxCaptureProcess,
+	setLinuxCaptureSession,
+	setLinuxCaptureStopRequested,
+	setLinuxCaptureTargetPath,
 	setLinuxCursorScreenPoint,
+	setLinuxNativeCaptureActive,
 	setNativeCaptureMicrophonePath,
 	setNativeCaptureOutputBuffer,
 	setNativeCapturePaused,
@@ -126,6 +147,10 @@ import {
 	setWindowsOrphanedMicAudioPath,
 	setWindowsPendingVideoPath,
 	setWindowsSystemAudioPath,
+	linuxCapturePaused,
+	linuxCaptureProcess,
+	linuxCaptureTargetPath,
+	linuxNativeCaptureActive,
 	windowsCaptureOutputBuffer,
 	windowsCapturePaused,
 	windowsCaptureProcess,
@@ -638,6 +663,125 @@ export function registerRecordingHandlers(
 				}
 			}
 
+			// Linux native capture path (system ffmpeg: pipewiregrab on Wayland, x11grab on X11)
+			if (process.platform === "linux") {
+				const availability = await isNativeLinuxCaptureAvailable();
+				if (!availability.available) {
+					return {
+						success: false,
+						message: availability.reason ?? "Native Linux capture is not available.",
+					};
+				}
+
+				if (linuxCaptureProcess && !linuxNativeCaptureActive) {
+					try {
+						linuxCaptureProcess.kill();
+					} catch {
+						/* ignore */
+					}
+					setLinuxCaptureProcess(null);
+					setLinuxCaptureTargetPath(null);
+					setLinuxCaptureStopRequested(false);
+				}
+
+				if (linuxCaptureProcess) {
+					return {
+						success: false,
+						message: "A native Linux screen recording is already active.",
+					};
+				}
+
+				let lxProc: ChildProcessWithoutNullStreams | null = null;
+				try {
+					const ffmpegPath = await resolveSystemFfmpegPath();
+					if (!ffmpegPath) throw new Error("System ffmpeg not found");
+					const recordingsDir = await getRecordingsDir();
+					const timestamp = Date.now();
+					const outputPath = path.join(recordingsDir, `recording-${timestamp}.mp4`);
+
+					const captureSystemAudio = Boolean(options?.capturesSystemAudio);
+					const captureMicrophone = Boolean(options?.capturesMicrophone);
+					const systemAudioSource = captureSystemAudio
+						? await resolvePulseMonitorSource()
+						: null;
+
+					let display:
+						| { x: number; y: number; width: number; height: number; displayEnv: string }
+						| undefined;
+					if (availability.session === "x11") {
+						const d = getScreen().getPrimaryDisplay();
+						const sf = d.scaleFactor || 1;
+						// ponytail: primary display only; multi-monitor / mixed-DPI x11grab
+						// geometry is a known gap, fix when a Linux display picker exists.
+						display = {
+							x: Math.round(d.bounds.x * sf),
+							y: Math.round(d.bounds.y * sf),
+							width: Math.round(d.bounds.width * sf),
+							height: Math.round(d.bounds.height * sf),
+							displayEnv: process.env.DISPLAY || ":0.0",
+						};
+					}
+
+					const args = buildLinuxFfmpegArgs({
+						session: availability.session,
+						outputPath,
+						captureSystemAudio: captureSystemAudio && Boolean(systemAudioSource),
+						captureMicrophone,
+						systemAudioSource: systemAudioSource ?? "",
+						// ponytail: selected mic device isn't mapped to a pulse source yet; use default.
+						microphoneSource: "default",
+						display,
+					});
+
+					setLinuxCaptureOutputBuffer("");
+					setLinuxCaptureTargetPath(outputPath);
+					setLinuxCaptureStopRequested(false);
+					setLinuxCapturePaused(false);
+					setLinuxCaptureSession(availability.session);
+
+					lxProc = spawn(ffmpegPath, args, {
+						cwd: recordingsDir,
+						stdio: ["pipe", "pipe", "pipe"],
+					});
+					setLinuxCaptureProcess(lxProc);
+					attachLinuxCaptureLifecycle(lxProc);
+
+					let captureOutput = "";
+					lxProc.stdout.on("data", (chunk: Buffer) => {
+						captureOutput += chunk.toString();
+						setLinuxCaptureOutputBuffer(captureOutput);
+					});
+					lxProc.stderr.on("data", (chunk: Buffer) => {
+						captureOutput += chunk.toString();
+						setLinuxCaptureOutputBuffer(captureOutput);
+					});
+
+					await waitForLinuxCaptureStart(lxProc);
+					setLinuxNativeCaptureActive(true);
+					setNativeScreenRecordingActive(true);
+					// Mic capture goes through pulse directly, so no browser mic fallback.
+					return { success: true, microphoneFallbackRequired: false };
+				} catch (error) {
+					console.error("Failed to start native Linux capture:", error);
+					try {
+						if (lxProc) lxProc.kill();
+					} catch {
+						/* ignore */
+					}
+					setLinuxNativeCaptureActive(false);
+					setNativeScreenRecordingActive(false);
+					setLinuxCaptureProcess(null);
+					setLinuxCaptureTargetPath(null);
+					setLinuxCaptureStopRequested(false);
+					setLinuxCapturePaused(false);
+					return {
+						success: false,
+						message: "Failed to start native Linux capture",
+						error: String(error),
+					};
+				}
+			}
+
 			if (process.platform !== "darwin") {
 				return {
 					success: false,
@@ -1095,6 +1239,59 @@ export function registerRecordingHandlers(
 			}
 		}
 
+		// Linux native capture stop path
+		if (process.platform === "linux" && linuxNativeCaptureActive) {
+			try {
+				if (!linuxCaptureProcess) {
+					throw new Error("Native Linux capture process is not running");
+				}
+				const proc = linuxCaptureProcess;
+				setLinuxCaptureStopRequested(true);
+				proc.stdin.write("q");
+				const finalVideoPath = await waitForLinuxCaptureStop(proc);
+
+				setLinuxCaptureProcess(null);
+				setLinuxNativeCaptureActive(false);
+				setNativeScreenRecordingActive(false);
+				setLinuxCaptureTargetPath(null);
+				setLinuxCaptureStopRequested(false);
+				setLinuxCapturePaused(false);
+
+				await validateRecordedVideo(finalVideoPath);
+
+				// Persist cursor telemetry (X11 only — Wayland telemetry is ignored since
+				// the overlay is off there) so the editor finds it immediately.
+				snapshotCursorTelemetryForPersistence();
+				try {
+					await persistPendingCursorTelemetry(finalVideoPath);
+				} catch (error) {
+					console.warn(
+						"Failed to persist cursor telemetry during native Linux stop:",
+						error,
+					);
+				}
+
+				return { success: true, path: finalVideoPath };
+			} catch (error) {
+				console.error("Failed to stop native Linux capture:", error);
+				const fallbackPath = await resolveExistingPath(linuxCaptureTargetPath);
+				setLinuxNativeCaptureActive(false);
+				setNativeScreenRecordingActive(false);
+				setLinuxCaptureProcess(null);
+				setLinuxCaptureTargetPath(null);
+				setLinuxCaptureStopRequested(false);
+				setLinuxCapturePaused(false);
+				if (fallbackPath) {
+					return { success: true, path: fallbackPath };
+				}
+				return {
+					success: false,
+					message: "Failed to stop native Linux capture",
+					error: String(error),
+				};
+			}
+		}
+
 		if (process.platform !== "darwin") {
 			return {
 				success: false,
@@ -1288,6 +1485,27 @@ export function registerRecordingHandlers(
 			}
 		}
 
+		if (process.platform === "linux") {
+			if (!linuxNativeCaptureActive || !linuxCaptureProcess) {
+				return { success: false, message: "No native Linux screen recording is active." };
+			}
+			if (linuxCapturePaused) {
+				return { success: true };
+			}
+			try {
+				// ponytail: SIGSTOP freezes ffmpeg; may add minor A/V drift across pauses.
+				linuxCaptureProcess.kill("SIGSTOP");
+				setLinuxCapturePaused(true);
+				return { success: true };
+			} catch (error) {
+				return {
+					success: false,
+					message: "Failed to pause native Linux capture",
+					error: String(error),
+				};
+			}
+		}
+
 		if (process.platform !== "darwin") {
 			return {
 				success: false,
@@ -1339,6 +1557,26 @@ export function registerRecordingHandlers(
 			}
 		}
 
+		if (process.platform === "linux") {
+			if (!linuxNativeCaptureActive || !linuxCaptureProcess) {
+				return { success: false, message: "No native Linux screen recording is active." };
+			}
+			if (!linuxCapturePaused) {
+				return { success: true };
+			}
+			try {
+				linuxCaptureProcess.kill("SIGCONT");
+				setLinuxCapturePaused(false);
+				return { success: true };
+			} catch (error) {
+				return {
+					success: false,
+					message: "Failed to resume native Linux capture",
+					error: String(error),
+				};
+			}
+		}
+
 		if (process.platform !== "darwin") {
 			return {
 				success: false,
@@ -1378,6 +1616,14 @@ export function registerRecordingHandlers(
 
 	ipcMain.handle("is-native-windows-capture-available", async () => {
 		return { available: await isNativeWindowsCaptureAvailable() };
+	});
+
+	ipcMain.handle("is-native-linux-capture-available", async () => {
+		return isNativeLinuxCaptureAvailable();
+	});
+
+	ipcMain.handle("set-captured-stream-size", (_, width: number, height: number) => {
+		setCapturedStreamSize(width, height);
 	});
 
 	ipcMain.handle("get-last-native-capture-diagnostics", async () => {
@@ -1823,6 +2069,7 @@ export function registerRecordingHandlers(
 			resetCursorCaptureClock();
 			setLinuxCursorScreenPoint(null);
 			setLastLeftClick(null);
+			startHyprlandCursorTracking();
 			sampleCursorPoint();
 			startCursorSampling();
 			void startInteractionCapture();
@@ -1830,6 +2077,7 @@ export function registerRecordingHandlers(
 			setIsCursorCaptureActive(false);
 			stopCursorCapture();
 			stopInteractionCapture();
+			stopHyprlandCursorTracking();
 			stopWindowBoundsCapture();
 			stopNativeCursorMonitor();
 			showCursor();

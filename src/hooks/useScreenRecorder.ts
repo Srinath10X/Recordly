@@ -9,7 +9,9 @@ import {
 	selectWebcamRecordingMimeType,
 } from "./recordingMimeType";
 
-const TARGET_FRAME_RATE = 60;
+// 30fps keeps browser/portal capture smooth (60fps was choppy on Linux) and,
+// being below HIGH_FRAME_RATE_THRESHOLD, also disables the 1.7x bitrate boost.
+const TARGET_FRAME_RATE = 30;
 const TARGET_WIDTH = 3840;
 const TARGET_HEIGHT = 2160;
 const FOUR_K_PIXELS = TARGET_WIDTH * TARGET_HEIGHT;
@@ -190,9 +192,34 @@ export function normalizeBrowserMicrophoneProfile(value?: string | null): Browse
 
 export function resolveBrowserCaptureCursorPolicy({
 	nativeWindowsCaptureStartFailed = false,
+	isLinux = false,
+	isHyprland = false,
 }: {
 	nativeWindowsCaptureStartFailed?: boolean;
+	isLinux?: boolean;
+	isHyprland?: boolean;
 } = {}): BrowserCaptureCursorPolicy {
+	if (isLinux) {
+		if (isHyprland) {
+			// Hyprland exposes cursor position + window geometry via IPC, so the main
+			// process can feed the animated overlay a correct window-relative position.
+			// Use the overlay (don't bake the OS cursor, hide it to avoid a double).
+			return {
+				streamCursor: "never",
+				hideOsCursorBeforeRecording: true,
+				hideEditorOverlayCursorByDefault: false,
+			};
+		}
+		// Other Wayland compositors give no cursor position, so an overlay can't be
+		// positioned for a portal-cropped window. Bake the real cursor into the stream
+		// (cursor:"always" → portal Embedded), correct under zoom/crop like OBS.
+		return {
+			streamCursor: "always",
+			hideOsCursorBeforeRecording: false,
+			hideEditorOverlayCursorByDefault: true,
+		};
+	}
+
 	if (nativeWindowsCaptureStartFailed) {
 		// If WGC already failed, avoid the telemetry overlay path that can lag on
 		// constrained Windows systems; keep the browser-captured cursor instead.
@@ -1438,7 +1465,31 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				}
 			}
 
-			if (useNativeMacScreenCapture || useNativeWindowsCapture) {
+			let useNativeLinuxCapture = false;
+			let linuxCaptureSession: "wayland" | "x11" | null = null;
+			if (
+				platform === "linux" &&
+				(selectedSource.id?.startsWith("screen:") ||
+					selectedSource.id?.startsWith("window:")) &&
+				typeof window.electronAPI.startNativeScreenRecording === "function" &&
+				typeof window.electronAPI.isNativeLinuxCaptureAvailable === "function"
+			) {
+				try {
+					const avail = await window.electronAPI.isNativeLinuxCaptureAvailable();
+					useNativeLinuxCapture = Boolean(avail?.available);
+					linuxCaptureSession = avail?.session ?? null;
+					if (!useNativeLinuxCapture && !hasShownNativeWindowsFallbackToast.current) {
+						hasShownNativeWindowsFallbackToast.current = true;
+						toast.info(
+							"Native Linux capture is unavailable. Falling back to browser capture.",
+						);
+					}
+				} catch {
+					useNativeLinuxCapture = false;
+				}
+			}
+
+			if (useNativeMacScreenCapture || useNativeWindowsCapture || useNativeLinuxCapture) {
 				// Resolve the selected mic label for native capture backends.
 				let micLabel: string | undefined;
 				if (microphoneEnabled) {
@@ -1476,6 +1527,17 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 								"Native Windows capture failed to start. Falling back to browser capture.",
 							);
 						}
+					} else if (useNativeLinuxCapture) {
+						console.warn(
+							"Native Linux capture failed, falling back to browser capture:",
+							nativeResult.error ?? nativeResult.message,
+						);
+						if (!hasShownNativeWindowsFallbackToast.current) {
+							hasShownNativeWindowsFallbackToast.current = true;
+							toast.warning(
+								"Native Linux capture failed to start. Falling back to browser capture.",
+							);
+						}
 					} else if (!nativeResult.userNotified) {
 						throw new Error(
 							nativeResult.error ??
@@ -1497,6 +1559,12 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					nativeScreenRecording.current = true;
 					nativeWindowsRecording.current = useNativeWindowsCapture;
 					resetRecordingClock(mainStartedAt);
+					if (useNativeLinuxCapture) {
+						// Wayland bakes the real cursor and leaves the animated overlay off;
+						// X11 telemetry is valid so the overlay stays on.
+						hideEditorOverlayCursorByDefault.current =
+							linuxCaptureSession === "wayland";
+					}
 					webcamTimeOffsetMs.current =
 						webcamStartTime.current === null
 							? 0
@@ -1583,6 +1651,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 			const browserCursorPolicy = resolveBrowserCaptureCursorPolicy({
 				nativeWindowsCaptureStartFailed,
+				isLinux: platform === "linux",
+				isHyprland:
+					platform === "linux" &&
+					typeof window.electronAPI.isHyprland === "function" &&
+					window.electronAPI.isHyprland(),
 			});
 			hideEditorOverlayCursorByDefault.current =
 				browserCursorPolicy.hideEditorOverlayCursorByDefault;
@@ -1637,8 +1710,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						audio: withAudio,
 						video: {
 							displaySurface: "monitor",
-							width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
-							height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
+							// Don't request 4K: capturing oversized then downscaling is a
+							// main source of choppy Linux capture. Let the compositor deliver
+							// native resolution (cap at 4K only as an upper bound).
+							width: { max: TARGET_WIDTH },
+							height: { max: TARGET_HEIGHT },
 							frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
 							cursor: browserCursorPolicy.streamCursor,
 						},
@@ -1788,6 +1864,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				frameRate = TARGET_FRAME_RATE,
 			} = videoTrack.getSettings();
 
+			// Tell the main process the captured resolution so Hyprland cursor tracking
+			// can lock onto the exact window being recorded (raw, pre-alignment size).
+			if (platform === "linux") {
+				console.log(
+					`[cursor] forwarding captured stream size ${width}x${height} (fn=${typeof window.electronAPI.setCapturedStreamSize})`,
+				);
+				void window.electronAPI.setCapturedStreamSize?.(width, height);
+			}
+
 			width = Math.floor(width / CODEC_ALIGNMENT) * CODEC_ALIGNMENT;
 			height = Math.floor(height / CODEC_ALIGNMENT) * CODEC_ALIGNMENT;
 
@@ -1820,6 +1905,33 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			recorder.ondataavailable = (event) => {
 				if (event.data && event.data.size > 0) chunks.current.push(event.data);
 			};
+			recorder.onstart = () => {
+				// Anchor cursor capture to the ACTUAL first frame. The portal stream has
+				// ~1.5s startup latency, so recorder.start() runs well before frames flow;
+				// starting the cursor clock here keeps it in sync with the video timeline.
+				if (platform === "linux") {
+					void window.electronAPI?.setRecordingState(true);
+				}
+			};
+			if (platform === "linux") {
+				const vt = stream.current.getVideoTracks()[0];
+				// The portal negotiates the real resolution a beat after the stream opens
+				// (4K ideal -> actual), and the delay varies (1.5–3+s). Poll and forward
+				// on every size change for the first 10s so Hyprland cursor tracking locks
+				// onto the correct window as soon as the resolution settles.
+				let lastForwarded = "";
+				const sizePoll = setInterval(() => {
+					const s = vt?.getSettings?.();
+					if (s?.width && s?.height) {
+						const key = `${s.width}x${s.height}`;
+						if (key !== lastForwarded) {
+							lastForwarded = key;
+							void window.electronAPI.setCapturedStreamSize?.(s.width, s.height);
+						}
+					}
+				}, 300);
+				setTimeout(() => clearInterval(sizePoll), 10000);
+			}
 			recorder.onstop = async () => {
 				cleanupCapturedMedia();
 				if (chunks.current.length === 0) {
@@ -1908,10 +2020,14 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				webcamStartTime.current === null ? 0 : webcamStartTime.current - mainStartedAt;
 			recorder.start(RECORDER_TIMESLICE_MS);
 			setRecording(true);
-			try {
-				await window.electronAPI?.setRecordingState(true);
-			} catch (stateError) {
-				console.warn("Failed to notify main process that recording started:", stateError);
+			// On Linux the cursor clock is started from recorder.onstart (first frame) to
+			// stay in sync with the portal stream; other platforms start it immediately.
+			if (platform !== "linux") {
+				try {
+					await window.electronAPI?.setRecordingState(true);
+				} catch (stateError) {
+					console.warn("Failed to notify main process that recording started:", stateError);
+				}
 			}
 		} catch (error) {
 			console.error("Failed to start recording:", error);

@@ -24,6 +24,7 @@ import {
 } from "../state";
 import type { CursorInteractionType, CursorTelemetryPoint, CursorVisualType } from "../types";
 import { getScreen, getTelemetryPathForVideo } from "../utils";
+import { getHyprlandNormalizedCursor } from "./hyprland";
 
 export function clamp(value: number, min: number, max: number) {
 	return Math.min(max, Math.max(min, value));
@@ -171,6 +172,15 @@ export function getCursorCaptureElapsedMs(nowMs = Date.now()) {
 }
 
 export function getNormalizedCursorPoint() {
+	// On Hyprland, derive the window-relative position from hyprctl IPC — Electron's
+	// getCursorScreenPoint() is frozen on Wayland and there's no window-bounds source.
+	if (process.platform === "linux") {
+		const hyprPoint = getHyprlandNormalizedCursor();
+		if (hyprPoint) {
+			return { cx: hyprPoint.cx, cy: hyprPoint.cy };
+		}
+	}
+
 	const fallbackCursor = getScreen().getCursorScreenPoint();
 	const linuxCursorCache = process.platform === "linux" ? linuxCursorScreenPoint : null;
 	const isLinuxCacheFresh = !!linuxCursorCache && Date.now() - linuxCursorCache.updatedAt <= 1000;

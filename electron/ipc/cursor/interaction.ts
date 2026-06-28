@@ -10,15 +10,14 @@ import {
 	setHasLoggedInteractionHookFailure,
 	lastLeftClick,
 	setLastLeftClick,
-	setLinuxCursorScreenPoint,
 } from "../state";
 import {
 	getNormalizedCursorPoint,
 	getCursorCaptureElapsedMs,
-	getHookCursorScreenPoint,
 	isCursorCapturePaused,
 	pushCursorSample,
 } from "./telemetry";
+import { startLinuxClickCapture } from "./linuxClicks";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -254,43 +253,38 @@ export async function startInteractionCapture() {
 			pushCursorSample(point.cx, point.cy, timeMs, "mouseup");
 		};
 
-		const onMouseMove = (event: HookMouseEvent) => {
-			if (
-				process.platform !== "linux" ||
-				!isCursorCaptureActive ||
-				isCursorCapturePaused()
-			) {
-				return;
-			}
-
-			const point = getHookCursorScreenPoint(event);
-			if (!point) {
-				return;
-			}
-
-			setLinuxCursorScreenPoint({ x: point.x, y: point.y, updatedAt: Date.now() });
-		};
-
-		hook.on("mousedown", onMouseDown);
-		hook.on("mouseup", onMouseUp);
+		let stopLinuxClicks: (() => void) | null = null;
 		if (process.platform === "linux") {
-			hook.on("mousemove", onMouseMove);
+			// Position comes from Hyprland IPC (see getNormalizedCursorPoint); clicks
+			// come from libinput because uiohook can't grab global clicks on Wayland.
+			stopLinuxClicks = startLinuxClickCapture((button, pressed) => {
+				if (pressed) {
+					onMouseDown({ button } as HookMouseEvent);
+				} else {
+					onMouseUp();
+				}
+			});
+		} else {
+			hook.on("mousedown", onMouseDown);
+			hook.on("mouseup", onMouseUp);
 		}
 
 		setInteractionCaptureCleanup(() => {
+			if (stopLinuxClicks) {
+				try {
+					stopLinuxClicks();
+				} catch {
+					// ignore libinput cleanup errors
+				}
+				stopLinuxClicks = null;
+			}
 			try {
 				if (typeof hook.off === "function") {
 					hook.off("mousedown", onMouseDown);
 					hook.off("mouseup", onMouseUp);
-					if (process.platform === "linux") {
-						hook.off("mousemove", onMouseMove);
-					}
 				} else if (typeof hook.removeListener === "function") {
 					hook.removeListener("mousedown", onMouseDown);
 					hook.removeListener("mouseup", onMouseUp);
-					if (process.platform === "linux") {
-						hook.removeListener("mousemove", onMouseMove);
-					}
 				}
 			} catch {
 				// ignore listener cleanup errors
