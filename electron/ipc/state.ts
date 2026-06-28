@@ -47,6 +47,15 @@ export let windowsMicAudioPath: string | null = null;
 export let windowsOrphanedMicAudioPath: string | null = null;
 export let windowsPendingVideoPath: string | null = null;
 
+// ── Linux native capture (system ffmpeg) ──────────────────────────────────────
+export let linuxCaptureProcess: ChildProcessWithoutNullStreams | null = null;
+export let linuxCaptureOutputBuffer = "";
+export let linuxCaptureTargetPath: string | null = null;
+export let linuxNativeCaptureActive = false;
+export let linuxCaptureStopRequested = false;
+export let linuxCapturePaused = false;
+export let linuxCaptureSession: "wayland" | "x11" | null = null;
+
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 export let lastNativeCaptureDiagnostics: NativeCaptureDiagnostics | null = null;
 
@@ -183,6 +192,28 @@ export function setWindowsOrphanedMicAudioPath(v: string | null) {
 }
 export function setWindowsPendingVideoPath(v: string | null) {
 	windowsPendingVideoPath = v;
+}
+
+export function setLinuxCaptureProcess(v: ChildProcessWithoutNullStreams | null) {
+	linuxCaptureProcess = v;
+}
+export function setLinuxCaptureOutputBuffer(v: string) {
+	linuxCaptureOutputBuffer = v;
+}
+export function setLinuxCaptureTargetPath(v: string | null) {
+	linuxCaptureTargetPath = v;
+}
+export function setLinuxNativeCaptureActive(v: boolean) {
+	linuxNativeCaptureActive = v;
+}
+export function setLinuxCaptureStopRequested(v: boolean) {
+	linuxCaptureStopRequested = v;
+}
+export function setLinuxCapturePaused(v: boolean) {
+	linuxCapturePaused = v;
+}
+export function setLinuxCaptureSession(v: "wayland" | "x11" | null) {
+	linuxCaptureSession = v;
 }
 
 export function setLastNativeCaptureDiagnostics(v: NativeCaptureDiagnostics | null) {

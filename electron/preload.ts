@@ -537,8 +537,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	stopFfmpegRecording: () => {
 		return ipcRenderer.invoke("stop-ffmpeg-recording");
 	},
-	storeRecordedVideo: (videoData: ArrayBuffer, fileName: string) => {
-		return ipcRenderer.invoke("store-recorded-video", videoData, fileName);
+	storeRecordedVideo: (
+		videoData: ArrayBuffer,
+		fileName: string,
+		options?: { sidecar?: boolean },
+	) => {
+		return ipcRenderer.invoke("store-recorded-video", videoData, fileName, options);
 	},
 	storeMicrophoneSidecar: (
 		audioData: ArrayBuffer,
@@ -959,6 +963,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	},
 	isNativeWindowsCaptureAvailable: () =>
 		ipcRenderer.invoke("is-native-windows-capture-available"),
+	isNativeLinuxCaptureAvailable: () =>
+		ipcRenderer.invoke("is-native-linux-capture-available"),
+	isHyprland: () => Boolean(process.env.HYPRLAND_INSTANCE_SIGNATURE),
+	setCapturedStreamSize: (width: number, height: number) =>
+		ipcRenderer.invoke("set-captured-stream-size", width, height),
 	muxNativeWindowsRecording: (expectedDurationMs?: number) =>
 		ipcRenderer.invoke("mux-native-windows-recording", expectedDurationMs),
 	hideOsCursor: () => ipcRenderer.invoke("hide-cursor"),
