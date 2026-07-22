@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, ipcMain } from "electron";
 import { USER_DATA_PATH } from "./appPaths";
+import { getHyprlandCursorPos } from "./ipc/cursor/hyprland";
 import { getHudOverlayWindowBounds, resizeHudOverlayFallbackBounds } from "./hudOverlayBounds";
 import { getPackagedRendererBaseUrl } from "./rendererServer";
 
@@ -30,6 +31,13 @@ let hudOverlayIgnoringMouse = true;
 let hudOverlaySourceSelectionActive = false;
 let hudOverlayMouseReassertTimer: NodeJS.Timeout | null = null;
 let hudOverlayRecordingActive = false;
+// Hyprland click-through hit-test: the renderer reports the interactive content
+// rect (bar + any open dropdown) in window coords; a poll toggles the window
+// click-through based on whether hyprctl's cursor is inside it.
+let hudOverlayContentRect: { x: number; y: number; width: number; height: number } | null = null;
+let hudOverlayCursorPollTimer: NodeJS.Timeout | null = null;
+let hudOverlayCursorPollInFlight = false;
+let hudOverlayHitTestIgnoring: boolean | null = null;
 let countdownWindow: BrowserWindow | null = null;
 let updateToastWindow: BrowserWindow | null = null;
 
@@ -124,7 +132,11 @@ function getWindowsBuildNumber(): number | null {
 
 export function isHudOverlayMousePassthroughSupported(): boolean {
 	if (process.platform === "linux") {
-		return false;
+		// Wayland has no per-region click-through forwarding, but on Hyprland we emulate
+		// it with a hyprctl cursorpos hit-test (see the HUD cursor poll below): keep the
+		// full-size click-through overlay and toggle interactivity by cursor position.
+		// Other Linux compositors fall back to the fixed non-passthrough window.
+		return Boolean(process.env.HYPRLAND_INSTANCE_SIGNATURE);
 	}
 
 	const build = getWindowsBuildNumber();
@@ -293,6 +305,18 @@ function setHudOverlayMousePassthrough(ignore: boolean) {
 		return;
 	}
 
+	// Hyprland: the hyprctl cursorpos hit-test poll owns setIgnoreMouseEvents (it makes
+	// the full-size overlay interactive only over the bar/dropdown). Keep bounds correct
+	// and let the poll drive click-through — including during recording.
+	if (process.platform === "linux" && isHudOverlayMousePassthroughSupported()) {
+		if (hudOverlayRecordingActive) {
+			hudOverlayFallbackExpanded = false;
+		}
+		applyHudOverlayBounds();
+		ensureHudOverlayCursorPoll();
+		return;
+	}
+
 	if (hudOverlayRecordingActive) {
 		hudOverlayFallbackExpanded = false;
 		applyHudOverlayBounds();
@@ -319,6 +343,74 @@ function setHudOverlayMousePassthrough(ignore: boolean) {
 ipcMain.on("hud-overlay-set-ignore-mouse", (_event, ignore: boolean) => {
 	setHudOverlayMousePassthrough(Boolean(ignore));
 });
+
+function isHudHyprlandHitTestActive(): boolean {
+	return (
+		process.platform === "linux" &&
+		isHudOverlayMousePassthroughSupported() &&
+		!!hudOverlayWindow &&
+		!hudOverlayWindow.isDestroyed() &&
+		hudOverlayWindow.isVisible()
+	);
+}
+
+function stopHudOverlayCursorPoll() {
+	if (hudOverlayCursorPollTimer) {
+		clearInterval(hudOverlayCursorPollTimer);
+		hudOverlayCursorPollTimer = null;
+	}
+	hudOverlayHitTestIgnoring = null;
+}
+
+async function hudOverlayCursorHitTest() {
+	if (hudOverlayCursorPollInFlight) return;
+	if (!isHudHyprlandHitTestActive() || !hudOverlayWindow || !hudOverlayContentRect) return;
+	hudOverlayCursorPollInFlight = true;
+	try {
+		const pos = await getHyprlandCursorPos();
+		if (!pos || !hudOverlayWindow || hudOverlayWindow.isDestroyed()) return;
+		const win = hudOverlayWindow.getBounds();
+		const r = hudOverlayContentRect;
+		// content rect is in window/CSS coords; window covers the work area, so add the
+		// window origin to get screen (logical) coords for the hyprctl cursor.
+		const left = win.x + r.x;
+		const top = win.y + r.y;
+		const inside =
+			pos.x >= left && pos.x < left + r.width && pos.y >= top && pos.y < top + r.height;
+		const shouldIgnore = !inside; // ignore mouse (click-through) when NOT over content
+		if (shouldIgnore !== hudOverlayHitTestIgnoring) {
+			hudOverlayHitTestIgnoring = shouldIgnore;
+			hudOverlayWindow.setIgnoreMouseEvents(shouldIgnore, { forward: true });
+		}
+	} finally {
+		hudOverlayCursorPollInFlight = false;
+	}
+}
+
+function ensureHudOverlayCursorPoll() {
+	if (!isHudHyprlandHitTestActive()) {
+		stopHudOverlayCursorPoll();
+		return;
+	}
+	if (hudOverlayCursorPollTimer) return;
+	hudOverlayHitTestIgnoring = null;
+	hudOverlayCursorPollTimer = setInterval(() => void hudOverlayCursorHitTest(), 40);
+}
+
+// The renderer reports the interactive content rect (bar + any open dropdown) in
+// window coords. On Hyprland we keep the full-size click-through overlay and use a
+// hyprctl cursorpos hit-test to make it interactive only over that rect — emulating
+// the per-region click-through (forward) that Wayland lacks natively.
+ipcMain.on(
+	"hud-overlay-content-size",
+	(_event, x: number, y: number, width: number, height: number) => {
+		if (process.platform !== "linux") return;
+		if (![x, y, width, height].every((v) => Number.isFinite(v))) return;
+		hudOverlayContentRect =
+			width > 0 && height > 0 ? { x, y, width, height } : null;
+		ensureHudOverlayCursorPoll();
+	},
+);
 
 ipcMain.on("hud-overlay-set-source-selection-active", (_event, active: boolean) => {
 	hudOverlaySourceSelectionActive = Boolean(active);
@@ -473,6 +565,9 @@ export function createHudOverlayWindow(): BrowserWindow {
 				}
 			}, 50);
 		}
+		if (process.platform === "linux" && isHudOverlayMousePassthroughSupported()) {
+			ensureHudOverlayCursorPoll();
+		}
 	};
 
 	if (isHudOverlayCaptureProtectionSupported()) {
@@ -480,7 +575,13 @@ export function createHudOverlayWindow(): BrowserWindow {
 	}
 
 	if (isHudOverlayMousePassthroughSupported()) {
-		if (hudOverlayRecordingActive) {
+		if (process.platform === "linux") {
+			// Start click-through; the hyprctl cursorpos hit-test poll makes the overlay
+			// interactive only while the cursor is over the bar/dropdown.
+			hudOverlayIgnoringMouse = true;
+			hudOverlayHitTestIgnoring = true;
+			win.setIgnoreMouseEvents(true, { forward: true });
+		} else if (hudOverlayRecordingActive) {
 			hudOverlayIgnoringMouse = false;
 			win.setIgnoreMouseEvents(false);
 		} else {
@@ -578,6 +679,8 @@ export function createHudOverlayWindow(): BrowserWindow {
 		if (hudOverlayWindow === win) {
 			hudOverlayWindow = null;
 		}
+		stopHudOverlayCursorPoll();
+		hudOverlayContentRect = null;
 	});
 
 	if (VITE_DEV_SERVER_URL) {

@@ -75,6 +75,17 @@ function hyprQuery(command: string): Promise<string> {
 	});
 }
 
+/** Global cursor position in logical coordinates (Hyprland), or null. */
+export async function getHyprlandCursorPos(): Promise<{ x: number; y: number } | null> {
+	try {
+		const [gx, gy] = (await hyprQuery("cursorpos")).split(",").map((s) => Number(s.trim()));
+		if (!Number.isFinite(gx) || !Number.isFinite(gy)) return null;
+		return { x: gx, y: gy };
+	} catch {
+		return null;
+	}
+}
+
 function contains(c: HyprClient, gx: number, gy: number): boolean {
 	return (
 		gx >= c.at[0] && gx < c.at[0] + c.size[0] && gy >= c.at[1] && gy < c.at[1] + c.size[1]
