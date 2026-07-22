@@ -191,6 +191,51 @@ function LaunchWindowContent() {
 		};
 	}, [syncSelectedSource]);
 
+	// On Linux/Wayland there's no native per-region click-through. We report the
+	// interactive content rect (the bar PLUS any open dropdown, which portals outside
+	// the bar) so the main process can hit-test the cursor against it (hyprctl) and
+	// toggle click-through — interactive only over the bar/dropdown, click-through
+	// everywhere else. Polled because popovers open/close without resizing the bar.
+	useEffect(() => {
+		if (platform !== "linux") return;
+		let last = "";
+		const report = () => {
+			const base = hudContentRef.current;
+			if (!base) return;
+			const r = base.getBoundingClientRect();
+			let left = r.left;
+			let top = r.top;
+			let right = r.right;
+			let bottom = r.bottom;
+			document
+				.querySelectorAll(
+					'[data-radix-popper-content-wrapper],[role="menu"],[role="listbox"],[role="dialog"]',
+				)
+				.forEach((node) => {
+					const pr = (node as HTMLElement).getBoundingClientRect();
+					if (pr.width > 0 && pr.height > 0) {
+						left = Math.min(left, pr.left);
+						top = Math.min(top, pr.top);
+						right = Math.max(right, pr.right);
+						bottom = Math.max(bottom, pr.bottom);
+					}
+				});
+			const x = Math.floor(left);
+			const y = Math.floor(top);
+			const width = Math.ceil(right - left);
+			const height = Math.ceil(bottom - top);
+			if (width <= 0 || height <= 0) return;
+			const key = `${x},${y},${width},${height}`;
+			if (key !== last) {
+				last = key;
+				window.electronAPI?.hudOverlayContentSize?.(x, y, width, height);
+			}
+		};
+		report();
+		const id = window.setInterval(report, 150);
+		return () => window.clearInterval(id);
+	}, [platform]);
+
 	const hudStateTransition = {
 		duration: 0.24,
 		ease: [0.22, 1, 0.36, 1] as const,
